@@ -1,169 +1,213 @@
 import streamlit as st
 import pandas as pd
+from fuzzywuzzy import process
 from io import BytesIO
-
-# Optional fuzzy matching
-try:
-    from fuzzywuzzy import process
-    FUZZY_AVAILABLE = True
-except:
-    FUZZY_AVAILABLE = False
 
 st.set_page_config(page_title="AI Excel Data Cleaner", layout="wide")
 
 st.title("🤖 AI-Assisted Excel Data Cleaning Tool")
 
-uploaded_file = st.file_uploader("📂 Upload Excel File", type=["xlsx", "xls"])
+st.write(
+    "Upload a messy Excel dataset. The tool will detect duplicates, standardize names, "
+    "clean dates, correct formatting, and generate a data cleaning report."
+)
 
-if uploaded_file is None:
-    st.info("👆 Please upload a file to start")
-    st.stop()
+uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx", "xls"])
 
-# -----------------------------
-# READ FILE
-# -----------------------------
-df = pd.read_excel(uploaded_file)
+# ------------------------------------------------
+# Helper Functions
+# ------------------------------------------------
 
-st.subheader("📊 Raw Data Preview")
-st.dataframe(df)
+def standardize_column_names(df):
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
+    return df
 
-original_rows = len(df)
 
-# -----------------------------
-# CLEAN COLUMN NAMES
-# -----------------------------
-df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
-
-# -----------------------------
-# STEP 1: DETECT NUMERIC COLUMNS
-# -----------------------------
-numeric_columns = []
-
-for col in df.columns:
-    converted = pd.to_numeric(df[col], errors="coerce")
-    if converted.notna().sum() / len(df) > 0.8:
-        df[col] = converted
-        numeric_columns.append(col)
-
-# -----------------------------
-# 🔥 STEP 2: DETECT & FIX DATES FIRST (IMPORTANT)
-# -----------------------------
-date_columns = []
-
-for col in df.columns:
-
-    if col in numeric_columns:
-        continue
-
-    temp = df[col].astype(str).str.strip()
-
-    # Try multiple parsing strategies
-    dt1 = pd.to_datetime(temp, errors="coerce", dayfirst=True)
-    dt2 = pd.to_datetime(temp, errors="coerce", format="mixed")
-
-    # Combine results
-    final = dt1.fillna(dt2)
-
-    # If it's mostly dates → confirm column
-    if final.notna().sum() > len(df) * 0.5:
-
-        # ✅ FORCE FORMAT
-        df[col] = final.dt.strftime("%Y-%m-%d")
-
-        date_columns.append(col)
-
-# -----------------------------
-# STEP 3: CLEAN TEXT (AFTER DATE FIX)
-# -----------------------------
-for col in df.select_dtypes(include="object"):
-    if col not in numeric_columns and col not in date_columns:
+def clean_text_columns(df):
+    for col in df.select_dtypes(include="object"):
         df[col] = df[col].astype(str).str.strip().str.title()
+    return df
 
-# -----------------------------
-# STEP 4: HANDLE MISSING VALUES
-# -----------------------------
-missing_before = df.isna().sum().sum()
 
-for col in df.columns:
-    if col in numeric_columns:
-        df[col] = df[col].fillna(df[col].median())
-    else:
-        df[col] = df[col].fillna("Unknown")
+def clean_date_columns(df):
+    date_columns = []
 
-missing_after = df.isna().sum().sum()
-missing_fixed = missing_before - missing_after
+    for col in df.columns:
+        if "date" in col.lower():
 
-# -----------------------------
-# STEP 5: REMOVE DUPLICATES
-# -----------------------------
-duplicates = df[df.duplicated()]
+            df[col] = pd.to_datetime(
+                df[col],
+                errors="coerce",
+                infer_datetime_format=True
+            )
 
-if not duplicates.empty:
-    st.warning(f"⚠️ {len(duplicates)} duplicate rows found")
-    st.dataframe(duplicates)
+            df[col] = df[col].dt.strftime("%Y-%m-%d")
 
-before = len(df)
-df = df.drop_duplicates()
-removed = before - len(df)
+            date_columns.append(col)
 
-st.success(f"✅ Removed {removed} duplicate rows")
+    return df, date_columns
 
-# -----------------------------
-# STEP 6: NAME STANDARDIZATION
-# -----------------------------
-names_standardized = 0
 
-if FUZZY_AVAILABLE:
-    text_cols = df.select_dtypes(include="object").columns.tolist()
+def handle_missing_values(df):
 
-    if text_cols:
-        selected_col = st.selectbox("Select column for name standardization", text_cols)
+    missing_before = df.isna().sum().sum()
+
+    for col in df.columns:
+
+        if df[col].dtype == "object":
+            df[col] = df[col].fillna("Unknown")
+
+        else:
+            df[col] = df[col].fillna(df[col].median())
+
+    missing_after = df.isna().sum().sum()
+
+    fixed = missing_before - missing_after
+
+    return df, fixed
+
+
+def detect_duplicates(df):
+    return df[df.duplicated()]
+
+
+def remove_duplicates(df):
+
+    before = len(df)
+
+    df = df.drop_duplicates()
+
+    after = len(df)
+
+    removed = before - after
+
+    return df, removed
+
+
+def standardize_names(df, column, threshold=85):
+
+    unique_names = df[column].dropna().unique().tolist()
+
+    standardized = {}
+
+    for name in unique_names:
+
+        if not standardized:
+            standardized[name] = name
+            continue
+
+        match, score = process.extractOne(
+            name,
+            list(standardized.values())
+        )
+
+        if score >= threshold:
+            standardized[name] = match
+        else:
+            standardized[name] = name
+
+    df[column] = df[column].map(standardized)
+
+    return df, len(unique_names)
+
+
+def convert_df_to_excel(df):
+
+    output = BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+
+    return output.getvalue()
+
+
+# ------------------------------------------------
+# Processing
+# ------------------------------------------------
+
+if uploaded_file:
+
+    df = pd.read_excel(uploaded_file)
+
+    st.subheader("📊 Raw Data Preview")
+    st.dataframe(df)
+
+    original_rows = len(df)
+
+    # Standardize column names
+    df = standardize_column_names(df)
+
+    # Clean text columns
+    df = clean_text_columns(df)
+
+    # Clean date columns
+    df, date_columns = clean_date_columns(df)
+
+    if date_columns:
+        st.success(f"Date columns standardized: {date_columns}")
+
+    # Handle missing values
+    df, missing_fixed = handle_missing_values(df)
+
+    # Detect duplicates
+    duplicates = detect_duplicates(df)
+
+    if not duplicates.empty:
+        st.warning(f"{len(duplicates)} duplicate rows detected")
+        st.dataframe(duplicates)
+
+    # Remove duplicates
+    df, removed = remove_duplicates(df)
+
+    st.success(f"Removed {removed} duplicate rows")
+
+    # Name Standardization
+    name_columns = df.select_dtypes(include="object").columns.tolist()
+
+    names_standardized = 0
+
+    if name_columns:
+
+        selected_col = st.selectbox(
+            "Select column for name standardization",
+            name_columns
+        )
 
         if st.button("Standardize Names"):
-            unique_vals = df[selected_col].dropna().unique().tolist()
-            mapping = {}
 
-            for val in unique_vals:
-                if not mapping:
-                    mapping[val] = val
-                    continue
+            df, names_standardized = standardize_names(df, selected_col)
 
-                match, score = process.extractOne(val, list(mapping.values()))
-                mapping[val] = match if score > 85 else val
+            st.success("Names standardized successfully")
 
-            df[selected_col] = df[selected_col].map(mapping)
-            names_standardized = len(unique_vals)
+    # Cleaned data preview
+    st.subheader("✅ Cleaned Data Preview")
+    st.dataframe(df)
 
-            st.success("✅ Names standardized")
+    # Data Cleaning Report
+    st.subheader("📑 Data Cleaning Report")
 
-# -----------------------------
-# OUTPUT
-# -----------------------------
-st.subheader("✅ Cleaned Data Preview")
-st.dataframe(df)
+    report = {
+        "Original Rows": original_rows,
+        "Final Rows": len(df),
+        "Duplicates Removed": removed,
+        "Missing Values Fixed": missing_fixed,
+        "Unique Names Processed": names_standardized,
+        "Date Columns Standardized": date_columns
+    }
 
-st.subheader("📑 Data Cleaning Report")
+    st.json(report)
 
-st.json({
-    "Original Rows": original_rows,
-    "Final Rows": len(df),
-    "Duplicates Removed": removed,
-    "Missing Values Fixed": missing_fixed,
-    "Date Columns Standardized": date_columns,
-    "Numeric Columns": numeric_columns,
-    "Names Standardized": names_standardized
-})
+    # Download cleaned file
+    excel_file = convert_df_to_excel(df)
 
-# -----------------------------
-# DOWNLOAD
-# -----------------------------
-output = BytesIO()
-with pd.ExcelWriter(output, engine="openpyxl") as writer:
-    df.to_excel(writer, index=False)
-
-st.download_button(
-    "📥 Download Cleaned Excel",
-    data=output.getvalue(),
-    file_name="cleaned_data.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
+    st.download_button(
+        label="📥 Download Cleaned Excel",
+        data=excel_file,
+        file_name="cleaned_data.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )explain this
